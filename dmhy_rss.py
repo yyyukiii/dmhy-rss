@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 DMHY (动漫花园) RSS 生成器
-功能：抓取动漫花园资源列表前 N 页 + 详情页正文 -> 增量去重 -> 生成标准 RSS 2.0 feed
+功能：抓取动漫花园资源列表全部页 + 详情页正文 -> 增量去重 -> 生成 RSS 2.0 + xlsx
 用法：
   python dmhy_rss.py                 # 增量抓取（新条目抓详情正文）
-  python dmhy_rss.py --force         # 忽略去重，重新抓取并生成全部
-依赖：requests beautifulsoup4 feedgen
+  python dmhy_rss.py --force         # 忽略去重状态，重新抓取并生成全部
+依赖：requests beautifulsoup4 feedgen openpyxl
 """
 import argparse
 import json
@@ -48,6 +48,14 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dmhy_stat
 
 TZ_CST = timezone(timedelta(hours=8), "CST")
 DATE_RE = re.compile(r"(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2})")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def safe_xml(s) -> str:
+    """去掉 XML 1.0 不允许的控制字符（保留 \\t \\n \\r）。"""
+    if not s:
+        return ""
+    return _CONTROL_RE.sub("", str(s))
 
 
 def page_url(page: int) -> str:
@@ -122,11 +130,9 @@ def fetch_detail_content(url: str) -> str:
     nfo = soup.find("div", class_=re.compile(r"topic-nfo"))
     if nfo is None:
         return ""
-    # 去掉“簡介:”标签文字本身，保留内部 HTML
     label = nfo.find("strong")
     if label and "簡介" in label.get_text():
         label.decompose()
-    # 补全图片/链接为绝对地址
     for img in nfo.find_all("img"):
         src = img.get("src", "")
         if src.startswith("//"):
@@ -141,7 +147,7 @@ def fetch_detail_content(url: str) -> str:
 
 
 def fetch_pages(max_pages: int) -> list[dict]:
-    """抓取前 max_pages 页，返回条目列表（按最新→最旧）。"""
+    """从第 1 页翻到最后一页，返回所有条目（按最新→最旧）。"""
     all_topics = []
     seen_ids = set()
     for page in range(1, max_pages + 1):
@@ -177,7 +183,7 @@ def load_state(path: str) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):  # 旧版纯 id 列表
+        if isinstance(data, list):
             return {str(i): {"id": str(i)} for i in data}
         return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
@@ -201,11 +207,11 @@ def to_rfc822(iso_str: str | None) -> str:
 
 def build_feed(topics: list[dict], out_path: str, feed_url: str = "") -> None:
     fg = FeedGenerator()
-    fg.title(FEED_TITLE)
+    fg.title(safe_xml(FEED_TITLE))
     fg.link(href=FEED_LINK, rel="alternate")
     self_url = feed_url or "file:///" + out_path.replace("\\", "/")
     fg.link(href=self_url, rel="self")
-    fg.description(FEED_DESC)
+    fg.description(safe_xml(FEED_DESC))
     fg.language("zh-cn")
 
     def sort_key(t):
@@ -218,21 +224,20 @@ def build_feed(topics: list[dict], out_path: str, feed_url: str = "") -> None:
 
     for t in sorted(topics, key=sort_key):  # feedgen add_entry 头插，升序输入=最新在前
         fe = fg.add_entry()
-        fe.title(t["title"])
+        fe.title(safe_xml(t["title"]))
         fe.link(href=t["link"])
         fe.guid(t["link"], permalink=True)
         fe.pubDate(to_rfc822(t.get("pub_date")))
-        fe.category({"term": t.get("category", "")})
-        # 正文优先用详情页简介；否则给摘要
+        fe.category({"term": safe_xml(t.get("category", ""))})
         parts = []
         if t.get("size"):
-            parts.append(f"大小：{t['size']}")
+            parts.append(f"大小：{safe_xml(t['size'])}")
         if t.get("publisher"):
-            parts.append(f"发布人：{t['publisher']}")
+            parts.append(f"发布人：{safe_xml(t['publisher'])}")
         if t.get("magnet"):
             parts.append(f'<p>磁力链接：<a href="{t["magnet"]}">magnet</a></p>')
         meta = "<br/>".join(parts)
-        content = t.get("content") or ""
+        content = safe_xml(t.get("content") or "")
         if content:
             fe.description(meta + "<hr/>" + content)
             fe.content(content, type="html")
@@ -251,7 +256,7 @@ def export_xlsx(topics: list[dict], xlsx_path: str) -> None:
     ws = wb.active
     ws.title = "VCB-Studio 发布清单"
 
-    headers = ["发布日期", "标题", "分类", "大小", "发布人", "详情链接"]
+    headers = ["发布日期", "标题", "分类", "大小", "发布人"]
     ws.append(headers)
     header_font = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill("solid", fgColor="17365D")
@@ -281,16 +286,17 @@ def export_xlsx(topics: list[dict], xlsx_path: str) -> None:
         title = t.get("title", "")
         if title.startswith(("=", "+", "-", "@")):
             title = "'" + title
+        pub = safe_xml(pub)
+        title = safe_xml(title)
         ws.cell(row=row_num, column=1, value=pub)
         c_title = ws.cell(row=row_num, column=2, value=title)
         link = t.get("link", "")
         if link:
             c_title.hyperlink = link
             c_title.style = "Hyperlink"
-        ws.cell(row=row_num, column=3, value=t.get("category", ""))
-        ws.cell(row=row_num, column=4, value=t.get("size", ""))
-        ws.cell(row=row_num, column=5, value=t.get("publisher", ""))
-        ws.cell(row=row_num, column=6, value=link)
+        ws.cell(row=row_num, column=3, value=safe_xml(t.get("category", "")))
+        ws.cell(row=row_num, column=4, value=safe_xml(t.get("size", "")))
+        ws.cell(row=row_num, column=5, value=safe_xml(t.get("publisher", "")))
         if row_num % 2 == 0:
             for col in range(1, len(headers) + 1):
                 ws.cell(row=row_num, column=col).fill = zebra
@@ -300,9 +306,8 @@ def export_xlsx(topics: list[dict], xlsx_path: str) -> None:
     ws.column_dimensions["C"].width = 12
     ws.column_dimensions["D"].width = 10
     ws.column_dimensions["E"].width = 12
-    ws.column_dimensions["F"].width = 60
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:F{max(1, len(topics) + 1)}"
+    ws.auto_filter.ref = f"A1:E{max(1, len(topics) + 1)}"
     wb.save(xlsx_path)
 
 
@@ -330,11 +335,9 @@ def main() -> int:
         new_items = [t for t in fresh_topics if t["id"] not in state]
     print(f"[2/5] 新增条目 {len(new_items)} 条（历史已有 {len(state)} 条）")
 
-    # 先把新条目并入 state（新条目 content 暂为空）
     for t in new_items:
         state[t["id"]] = t
 
-    # [3/5] 新条目抓正文
     if FETCH_DETAIL and not args.no_detail and new_items:
         print(f"[3/5] 抓取 {len(new_items)} 条新条目详情正文...")
         for i, t in enumerate(new_items, 1):
@@ -345,14 +348,9 @@ def main() -> int:
     else:
         print("[3/5] 跳过新条目详情")
 
-    # [4/5] 历史回填：挑 state 里 content 为空的，按发布时间倒序，每次补 detail_batch 条
     if FETCH_DETAIL and not args.no_detail:
         missing = [t for t in state.values() if not t.get("content")]
-        # 按日期倒序：新的优先补
-        missing.sort(
-            key=lambda t: t.get("pub_date") or "",
-            reverse=True,
-        )
+        missing.sort(key=lambda t: t.get("pub_date") or "", reverse=True)
         backfill = missing[: args.detail_batch]
         if backfill:
             print(f"[4/5] 历史回填：{len(missing)} 条无正文，本次补 {len(backfill)} 条...")
@@ -366,7 +364,6 @@ def main() -> int:
     else:
         print("[4/5] 跳过历史回填")
 
-    # [5/5] 生成 feed + xlsx
     all_topics = list(state.values())
     build_feed(all_topics, args.out, args.feed_url)
     print(f"[5/5] 已生成 feed: {args.out}（共 {len(all_topics)} 条）")
