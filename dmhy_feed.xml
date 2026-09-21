@@ -2,13 +2,13 @@
 <rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">
   <channel>
     <title>VCB-Studio - 动漫花园资源网</title>
-    <link>https://raw.githubusercontent.com/USER/dmhy-rss/main/dmhy_feed.xml</link>
+    <link>https://raw.githubusercontent.com/yyyukiii/dmhy-rss/main/dmhy_feed.xml</link>
     <description>VCB-Studio 字幕组在动漫花园的最新发布（本地自建 RSS）</description>
-    <atom:link href="https://raw.githubusercontent.com/USER/dmhy-rss/main/dmhy_feed.xml" rel="self"/>
+    <atom:link href="https://raw.githubusercontent.com/yyyukiii/dmhy-rss/main/dmhy_feed.xml" rel="self"/>
     <docs>http://www.rssboard.org/rss-specification</docs>
     <generator>python-feedgen</generator>
     <language>zh-cn</language>
-    <lastBuildDate>Mon, 21 Sep 2026 16:37:47 +0000</lastBuildDate>
+    <lastBuildDate>Mon, 21 Sep 2026 16:55:05 +0000</lastBuildDate>
     <item>
       <title>[百冬练习组&amp;VCB-Studio] Re:从零开始的异世界生活 第三季 / Re:Zero kara Hajimeru Isekai Seikatsu 3rd Season / Re:ゼロから始める異世界生活 3rd Season 10-bit 1080p HEVC BDRip [Fin]</title>
       <link>https://share.dmhy.org/topics/view/711205_hyakuhuyu_VCB-Studio_Re_Re_Zero_kara_Hajimeru_Isekai_Seikatsu_3rd_Season_Re_3rd_Season_10-bit_1080p_HEVC_BDRip_Fin.html</link>
