@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 DMHY (动漫花园) RSS 生成器
-功能：抓取动漫花园资源列表页 -> 解析条目 -> 增量去重 -> 生成标准 RSS 2.0 feed
+功能：抓取动漫花园资源列表前 N 页 + 详情页正文 -> 增量去重 -> 生成标准 RSS 2.0 feed
 用法：
-  python dmhy_rss.py                 # 抓取并更新 feed（增量，已见过的条目不会重复）
-  python dmhy_rss.py --force         # 忽略去重状态，重新生成全部条目
-  python dmhy_rss.py --out <path>    # 指定输出文件
-依赖：requests beautifulsoup4 feedgen  (pip install requests beautifulsoup4 feedgen)
+  python dmhy_rss.py                 # 增量抓取（新条目抓详情正文）
+  python dmhy_rss.py --force         # 忽略去重，重新抓取并生成全部
+依赖：requests beautifulsoup4 feedgen
 """
 import argparse
 import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -23,14 +23,15 @@ from feedgen.feed import FeedGenerator
 # 配置（可按需修改）
 # ---------------------------------------------------------------------------
 BASE_URL = "https://share.dmhy.org"
-# 默认抓取 VCB-Studio(581) 的最新发布；想换其他字幕组/关键词，改这一行即可
-LIST_URL = (
-    "https://share.dmhy.org/topics/list?"
-    "keyword=&sort_id=0&team_id=581&order=date-desc"
-)
+LIST_BASE = "https://share.dmhy.org/topics/list"
+QUERY = "keyword=&sort_id=0&team_id=581&order=date-desc"
+MAX_PAGES = 5            # 每次抓取页数（约 80 条/页，5 页约 400 条）
+PAGE_DELAY = 0.5         # 列表页之间间隔
+DETAIL_DELAY = 0.3       # 详情页之间间隔，避免请求过快
+FETCH_DETAIL = True      # 是否抓取详情页正文
 FEED_TITLE = "VCB-Studio - 动漫花园资源网"
-FEED_DESC = "VCB-Studio 字幕组在动漫花园的最新发布（本地自建 RSS）"
-FEED_LINK = LIST_URL
+FEED_DESC = "VCB-Studio 字幕组在动漫花园的发布（含简介正文，本地自建 RSS）"
+FEED_LINK = f"{LIST_BASE}?{QUERY}"
 
 HEADERS = {
     "User-Agent": (
@@ -47,28 +48,36 @@ TZ_CST = timezone(timedelta(hours=8), "CST")
 DATE_RE = re.compile(r"(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2})")
 
 
-def fetch_page(url: str) -> str:
-    """抓取列表页，返回 HTML 文本。"""
+def page_url(page: int) -> str:
+    if page <= 1:
+        return f"{LIST_BASE}?{QUERY}"
+    return f"{LIST_BASE}/page/{page}?{QUERY}"
+
+
+def fetch_html(url: str) -> str:
     resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
     resp.encoding = "utf-8"
     return resp.text
 
 
-def parse_topics(html: str) -> list[dict]:
-    """解析 #topic_list 表格中的资源条目。"""
+def has_next_page(soup: BeautifulSoup) -> bool:
+    for a in soup.find_all("a", href=re.compile(r"/topics/list/page/")):
+        if "下一頁" in a.get_text():
+            return True
+    return False
+
+
+def parse_list_page(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", id="topic_list")
     if table is None:
         return []
-    rows = table.select("tbody tr")
     topics = []
-    for tr in rows:
+    for tr in table.select("tbody tr"):
         tds = tr.find_all("td")
         if len(tds) < 6:
             continue
-
-        # --- 日期：优先取隐藏 span 里的标准时间 ---
         pub_dt = None
         hidden = tds[0].find("span", style=lambda v: v and "display" in v)
         if hidden:
@@ -76,70 +85,119 @@ def parse_topics(html: str) -> list[dict]:
             if m:
                 y, mo, d, h, mi = map(int, m.groups())
                 pub_dt = datetime(y, mo, d, h, mi, tzinfo=TZ_CST)
-
-        # --- 标题与详情链接 ---
         title_a = tds[2].find("a", href=re.compile(r"/topics/view/"))
         if title_a is None:
             continue
         title = title_a.get_text(strip=True)
         href = title_a.get("href", "")
         topic_url = href if href.startswith("http") else BASE_URL + href
-        topic_id = re.search(r"/topics/view/(\d+)", href)
-        topic_id = topic_id.group(1) if topic_id else topic_url
-
-        # --- 分类 ---
+        m_id = re.search(r"/topics/view/(\d+)", href)
+        topic_id = m_id.group(1) if m_id else topic_url
         cat = tds[1].get_text(strip=True) if len(tds) > 1 else ""
-
-        # --- 磁链 ---
         magnet = ""
         m_a = tr.find("a", class_="arrow-magnet")
         if m_a is not None:
             magnet = m_a.get("href", "")
-
-        # --- 大小 ---
         size = tds[4].get_text(strip=True) if len(tds) > 4 else ""
-
-        # --- 发布人 ---
         publisher = tds[-1].get_text(strip=True) if len(tds) > 6 else ""
-
         topics.append({
-            "id": topic_id,
-            "title": title,
-            "link": topic_url,
-            "pub_date": pub_dt,
-            "category": cat,
-            "magnet": magnet,
-            "size": size,
-            "publisher": publisher,
+            "id": topic_id, "title": title, "link": topic_url,
+            "pub_date": pub_dt.isoformat() if pub_dt else None,
+            "category": cat, "magnet": magnet, "size": size,
+            "publisher": publisher, "content": "",
         })
     return topics
 
 
-def load_state(path: str) -> set:
-    """读取已见条目 id 集合。"""
+def fetch_detail_content(url: str) -> str:
+    """抓取详情页简介正文（保留 HTML 以保留图片和链接）。"""
+    try:
+        html = fetch_html(url)
+    except Exception as e:
+        print(f"      !! 详情页抓取失败 {url}: {e}")
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    nfo = soup.find("div", class_=re.compile(r"topic-nfo"))
+    if nfo is None:
+        return ""
+    # 去掉“簡介:”标签文字本身，保留内部 HTML
+    label = nfo.find("strong")
+    if label and "簡介" in label.get_text():
+        label.decompose()
+    # 补全图片/链接为绝对地址
+    for img in nfo.find_all("img"):
+        src = img.get("src", "")
+        if src.startswith("//"):
+            img["src"] = "https:" + src
+        elif src.startswith("/"):
+            img["src"] = BASE_URL + src
+    for a in nfo.find_all("a"):
+        href = a.get("href", "")
+        if href.startswith("/"):
+            a["href"] = BASE_URL + href
+    return nfo.decode_contents().strip()
+
+
+def fetch_pages(max_pages: int) -> list[dict]:
+    """抓取前 max_pages 页，返回条目列表（按最新→最旧）。"""
+    all_topics = []
+    seen_ids = set()
+    for page in range(1, max_pages + 1):
+        url = page_url(page)
+        print(f"    列表第 {page} 页: {url}")
+        try:
+            html = fetch_html(url)
+        except Exception as e:
+            print(f"      !! 抓取失败: {e}")
+            break
+        soup = BeautifulSoup(html, "html.parser")
+        topics = parse_list_page(html)
+        if not topics:
+            break
+        new_count = 0
+        for t in topics:
+            if t["id"] not in seen_ids:
+                seen_ids.add(t["id"])
+                all_topics.append(t)
+                new_count += 1
+        print(f"      解析 {len(topics)} 条，新增 {new_count} 条")
+        if not has_next_page(soup):
+            break
+        if page < max_pages:
+            time.sleep(PAGE_DELAY)
+    return all_topics
+
+
+def load_state(path: str) -> dict:
+    """读取历史条目 {id: topic_dict}。兼容旧版 list 格式。"""
     if not os.path.exists(path):
-        return set()
+        return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+            data = json.load(f)
+        if isinstance(data, list):  # 旧版纯 id 列表
+            return {str(i): {"id": str(i)} for i in data}
+        return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
-        return set()
+        return {}
 
 
-def save_state(path: str, seen: set) -> None:
+def save_state(path: str, state: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def to_rfc822(dt: datetime) -> str:
-    """转成 RSS 要求的 RFC822 时间格式。"""
-    if dt is None:
+def to_rfc822(iso_str: str | None) -> str:
+    if not iso_str:
+        return datetime.now(TZ_CST).strftime("%a, %d %b %Y %H:%M:%S %z")
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
         return datetime.now(TZ_CST).strftime("%a, %d %b %Y %H:%M:%S %z")
     return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
 
 
 def build_feed(topics: list[dict], out_path: str, feed_url: str = "") -> None:
-    """把条目写入标准 RSS 2.0 XML 文件。feed_url 为公开订阅地址（self link）。"""
     fg = FeedGenerator()
     fg.title(FEED_TITLE)
     fg.link(href=FEED_LINK, rel="alternate")
@@ -148,68 +206,85 @@ def build_feed(topics: list[dict], out_path: str, feed_url: str = "") -> None:
     fg.description(FEED_DESC)
     fg.language("zh-cn")
 
-    # 按发布时间倒序
-    topics_sorted = sorted(
-        topics,
-        key=lambda t: t["pub_date"] or datetime.min.replace(tzinfo=TZ_CST),
-        reverse=True,
-    )
-    for t in topics_sorted:
+    def sort_key(t):
+        if t.get("pub_date"):
+            try:
+                return datetime.fromisoformat(t["pub_date"])
+            except ValueError:
+                pass
+        return datetime.min.replace(tzinfo=TZ_CST)
+
+    for t in sorted(topics, key=sort_key):  # feedgen add_entry 头插，升序输入=最新在前
         fe = fg.add_entry()
         fe.title(t["title"])
         fe.link(href=t["link"])
         fe.guid(t["link"], permalink=True)
-        fe.pubDate(to_rfc822(t["pub_date"]))
-        fe.category({"term": t["category"]})
-        # 描述里带上大小、发布人和磁链，方便阅读器直接使用
-        desc_lines = []
-        if t["size"]:
-            desc_lines.append(f"大小：{t['size']}")
-        if t["category"]:
-            desc_lines.append(f"分类：{t['category']}")
-        if t["publisher"]:
-            desc_lines.append(f"发布人：{t['publisher']}")
-        if t["magnet"]:
-            desc_lines.append(f'<p>磁力链接：<a href="{t["magnet"]}">magnet</a></p>')
-        fe.description("<br/>".join(desc_lines) if desc_lines else t["title"])
+        fe.pubDate(to_rfc822(t.get("pub_date")))
+        fe.category({"term": t.get("category", "")})
+        # 正文优先用详情页简介；否则给摘要
+        parts = []
+        if t.get("size"):
+            parts.append(f"大小：{t['size']}")
+        if t.get("publisher"):
+            parts.append(f"发布人：{t['publisher']}")
+        if t.get("magnet"):
+            parts.append(f'<p>磁力链接：<a href="{t["magnet"]}">magnet</a></p>')
+        meta = "<br/>".join(parts)
+        content = t.get("content") or ""
+        if content:
+            fe.description(meta + "<hr/>" + content)
+            fe.content(content, type="html")
+        else:
+            fe.description(meta)
 
     fg.rss_file(out_path, pretty=True)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="DMHY RSS 生成器")
-    ap.add_argument("--force", action="store_true", help="忽略去重状态，重新生成全部")
+    ap.add_argument("--force", action="store_true", help="忽略去重状态，重新抓取并生成")
     ap.add_argument("--out", default=DEFAULT_OUT, help="输出 XML 文件路径")
-    ap.add_argument("--url", default=LIST_URL, help="要抓取的列表页 URL")
     ap.add_argument("--feed-url", default="", help="feed 的公开订阅地址（self link）")
+    ap.add_argument("--max-pages", type=int, default=MAX_PAGES, help=f"每次抓取页数（默认 {MAX_PAGES}）")
+    ap.add_argument("--no-detail", action="store_true", help="不抓取详情页正文")
     args = ap.parse_args()
 
-    print(f"[1/3] 抓取页面: {args.url}")
-    html = fetch_page(args.url)
-    topics = parse_topics(html)
-    if not topics:
-        print("!! 未解析到任何条目，可能页面结构变化或请求被拦截")
+    print(f"[1/4] 抓取列表前 {args.max_pages} 页...")
+    fresh_topics = fetch_pages(args.max_pages)
+    if not fresh_topics:
+        print("!! 未解析到任何条目")
         return 1
-    print(f"    解析到 {len(topics)} 条资源")
+    print(f"    本次列表共 {len(fresh_topics)} 条")
 
-    seen = load_state(STATE_FILE)
+    state = load_state(STATE_FILE)
     if args.force:
-        fresh = topics
+        new_items = fresh_topics
     else:
-        fresh = [t for t in topics if t["id"] not in seen]
-    print(f"[2/3] 新增条目: {len(fresh)} 条（去重库已有 {len(seen)} 条）")
+        new_items = [t for t in fresh_topics if t["id"] not in state]
+    print(f"[2/4] 新增条目 {len(new_items)} 条（历史已有 {len(state)} 条）")
 
-    # 增量模式下：新条目 + 历史全部条目，保证 feed 始终包含完整记录
-    all_topics = list(fresh)
-    if not args.force:
-        all_topics += [t for t in topics if t["id"] in seen]
+    # 对新条目抓详情正文
+    if FETCH_DETAIL and not args.no_detail and new_items:
+        print(f"[3/4] 抓取 {len(new_items)} 条详情正文...")
+        for i, t in enumerate(new_items, 1):
+            t["content"] = fetch_detail_content(t["link"])
+            if i % 20 == 0 or i == len(new_items):
+                print(f"      {i}/{len(new_items)}")
+            time.sleep(DETAIL_DELAY)
+    else:
+        print("[3/4] 跳过详情页抓取")
+
+    # 合并：新条目 + 历史条目，按本次列表顺序覆盖同名 id
+    merged = dict(state)
+    for t in new_items:
+        merged[t["id"]] = t
+    # feed 里同时包含本次列表条目 + 历史条目（历史条目保留旧 content）
+    all_topics = list(merged.values())
 
     build_feed(all_topics, args.out, args.feed_url)
-    print(f"[3/3] 已生成 feed: {args.out}")
+    print(f"[4/4] 已生成 feed: {args.out}（共 {len(all_topics)} 条）")
 
-    # 更新去重状态：把本次见过的 id 全部并入
-    seen.update(t["id"] for t in topics)
-    save_state(STATE_FILE, seen)
+    save_state(STATE_FILE, merged)
     return 0
 
 
