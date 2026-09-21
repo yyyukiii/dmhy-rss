@@ -25,9 +25,10 @@ from feedgen.feed import FeedGenerator
 BASE_URL = "https://share.dmhy.org"
 LIST_BASE = "https://share.dmhy.org/topics/list"
 QUERY = "keyword=&sort_id=0&team_id=581&order=date-desc"
-MAX_PAGES = 5            # 每次抓取页数（约 80 条/页，5 页约 400 条）
-PAGE_DELAY = 0.5         # 列表页之间间隔
-DETAIL_DELAY = 0.3       # 详情页之间间隔，避免请求过快
+MAX_PAGES = 500          # 列表翻页安全上限（实际自动停在最后一页）
+PAGE_DELAY = 0.3         # 列表页之间间隔
+DETAIL_DELAY = 0.2       # 详情页之间间隔
+DETAIL_BATCH = 400       # 每次运行最多补爬多少条无正文的历史详情
 FETCH_DETAIL = True      # 是否抓取详情页正文
 FEED_TITLE = "VCB-Studio - 动漫花园资源网"
 FEED_DESC = "VCB-Studio 字幕组在动漫花园的发布（含简介正文，本地自建 RSS）"
@@ -42,6 +43,7 @@ HEADERS = {
 }
 
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dmhy_feed.xml")
+XLSX_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dmhy_titles.xlsx")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dmhy_state.json")
 
 TZ_CST = timezone(timedelta(hours=8), "CST")
@@ -240,16 +242,81 @@ def build_feed(topics: list[dict], out_path: str, feed_url: str = "") -> None:
     fg.rss_file(out_path, pretty=True)
 
 
+def export_xlsx(topics: list[dict], xlsx_path: str) -> None:
+    """把全部条目导出成带样式、带超链接的 Excel 清单。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "VCB-Studio 发布清单"
+
+    headers = ["发布日期", "标题", "分类", "大小", "发布人", "详情链接"]
+    ws.append(headers)
+    header_font = Font(name="微软雅黑", bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill("solid", fgColor="17365D")
+    for col in range(1, len(headers) + 1):
+        c = ws.cell(row=1, column=col)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    zebra = PatternFill("solid", fgColor="DCE6F1")
+
+    def sort_key(t):
+        if t.get("pub_date"):
+            try:
+                return datetime.fromisoformat(t["pub_date"])
+            except ValueError:
+                pass
+        return datetime.min.replace(tzinfo=TZ_CST)
+
+    for row_num, t in enumerate(sorted(topics, key=sort_key, reverse=True), start=2):
+        pub = t.get("pub_date") or ""
+        if pub:
+            try:
+                pub = datetime.fromisoformat(pub).strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                pass
+        title = t.get("title", "")
+        if title.startswith(("=", "+", "-", "@")):
+            title = "'" + title
+        ws.cell(row=row_num, column=1, value=pub)
+        c_title = ws.cell(row=row_num, column=2, value=title)
+        link = t.get("link", "")
+        if link:
+            c_title.hyperlink = link
+            c_title.style = "Hyperlink"
+        ws.cell(row=row_num, column=3, value=t.get("category", ""))
+        ws.cell(row=row_num, column=4, value=t.get("size", ""))
+        ws.cell(row=row_num, column=5, value=t.get("publisher", ""))
+        ws.cell(row=row_num, column=6, value=link)
+        if row_num % 2 == 0:
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=row_num, column=col).fill = zebra
+
+    ws.column_dimensions["A"].width = 18
+    ws.column_dimensions["B"].width = 80
+    ws.column_dimensions["C"].width = 12
+    ws.column_dimensions["D"].width = 10
+    ws.column_dimensions["E"].width = 12
+    ws.column_dimensions["F"].width = 60
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:F{max(1, len(topics) + 1)}"
+    wb.save(xlsx_path)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="DMHY RSS 生成器")
     ap.add_argument("--force", action="store_true", help="忽略去重状态，重新抓取并生成")
     ap.add_argument("--out", default=DEFAULT_OUT, help="输出 XML 文件路径")
     ap.add_argument("--feed-url", default="", help="feed 的公开订阅地址（self link）")
-    ap.add_argument("--max-pages", type=int, default=MAX_PAGES, help=f"每次抓取页数（默认 {MAX_PAGES}）")
+    ap.add_argument("--max-pages", type=int, default=MAX_PAGES, help=f"列表翻页安全上限（默认 {MAX_PAGES}）")
+    ap.add_argument("--detail-batch", type=int, default=DETAIL_BATCH, help=f"每次补爬历史详情条数（默认 {DETAIL_BATCH}）")
     ap.add_argument("--no-detail", action="store_true", help="不抓取详情页正文")
     args = ap.parse_args()
 
-    print(f"[1/4] 抓取列表前 {args.max_pages} 页...")
+    print(f"[1/5] 抓取列表全部页（上限 {args.max_pages}）...")
     fresh_topics = fetch_pages(args.max_pages)
     if not fresh_topics:
         print("!! 未解析到任何条目")
@@ -261,30 +328,55 @@ def main() -> int:
         new_items = fresh_topics
     else:
         new_items = [t for t in fresh_topics if t["id"] not in state]
-    print(f"[2/4] 新增条目 {len(new_items)} 条（历史已有 {len(state)} 条）")
+    print(f"[2/5] 新增条目 {len(new_items)} 条（历史已有 {len(state)} 条）")
 
-    # 对新条目抓详情正文
+    # 先把新条目并入 state（新条目 content 暂为空）
+    for t in new_items:
+        state[t["id"]] = t
+
+    # [3/5] 新条目抓正文
     if FETCH_DETAIL and not args.no_detail and new_items:
-        print(f"[3/4] 抓取 {len(new_items)} 条详情正文...")
+        print(f"[3/5] 抓取 {len(new_items)} 条新条目详情正文...")
         for i, t in enumerate(new_items, 1):
             t["content"] = fetch_detail_content(t["link"])
             if i % 20 == 0 or i == len(new_items):
                 print(f"      {i}/{len(new_items)}")
             time.sleep(DETAIL_DELAY)
     else:
-        print("[3/4] 跳过详情页抓取")
+        print("[3/5] 跳过新条目详情")
 
-    # 合并：新条目 + 历史条目，按本次列表顺序覆盖同名 id
-    merged = dict(state)
-    for t in new_items:
-        merged[t["id"]] = t
-    # feed 里同时包含本次列表条目 + 历史条目（历史条目保留旧 content）
-    all_topics = list(merged.values())
+    # [4/5] 历史回填：挑 state 里 content 为空的，按发布时间倒序，每次补 detail_batch 条
+    if FETCH_DETAIL and not args.no_detail:
+        missing = [t for t in state.values() if not t.get("content")]
+        # 按日期倒序：新的优先补
+        missing.sort(
+            key=lambda t: t.get("pub_date") or "",
+            reverse=True,
+        )
+        backfill = missing[: args.detail_batch]
+        if backfill:
+            print(f"[4/5] 历史回填：{len(missing)} 条无正文，本次补 {len(backfill)} 条...")
+            for i, t in enumerate(backfill, 1):
+                t["content"] = fetch_detail_content(t["link"])
+                if i % 20 == 0 or i == len(backfill):
+                    print(f"      {i}/{len(backfill)}")
+                time.sleep(DETAIL_DELAY)
+        else:
+            print("[4/5] 所有条目均已有正文，无需回填")
+    else:
+        print("[4/5] 跳过历史回填")
 
+    # [5/5] 生成 feed + xlsx
+    all_topics = list(state.values())
     build_feed(all_topics, args.out, args.feed_url)
-    print(f"[4/4] 已生成 feed: {args.out}（共 {len(all_topics)} 条）")
+    print(f"[5/5] 已生成 feed: {args.out}（共 {len(all_topics)} 条）")
+    try:
+        export_xlsx(all_topics, XLSX_OUT)
+        print(f"      已生成清单: {XLSX_OUT}")
+    except Exception as e:
+        print(f"      !! xlsx 生成失败: {e}")
 
-    save_state(STATE_FILE, merged)
+    save_state(STATE_FILE, state)
     return 0
 
 
